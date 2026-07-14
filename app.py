@@ -17,11 +17,20 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
 
+from utils.file_reader import process_uploaded_files
+
 app = Flask(__name__)
 CORS(app)  # allow the Capacitor app (different origin) to call this backend
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# NOTE (July 2026): llama-3.3-70b-versatile is deprecated by Groq, shutting
+# down 08/16/26. openai/gpt-oss-120b is the recommended text-model replacement.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# Vision-capable model, used only when a student attaches an image.
+# qwen/qwen3.6-27b is Groq's current multimodal (text + image) model.
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")  # secret key, server-side only
@@ -187,22 +196,55 @@ def health():
         "status": "ok",
         "service": "Pe Adesua backend",
         "model": GROQ_MODEL,
+        "vision_model": GROQ_VISION_MODEL,
         "memory": "enabled" if supabase else "disabled (no Supabase config)"
     })
 
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    history = data.get("history", [])  # optional list of {role, text} for context — used if no logged-in memory
-    custom_prompt = data.get("systemPrompt", "").strip()  # optional override from frontend
-    mode = data.get("mode", "study").strip().lower()  # "study" or "prompt"
-    access_token = data.get("accessToken", "").strip()  # optional Supabase session token
-    subject = (data.get("subject") or "general").strip()  # current subject, for memory scoping
+    # Two request shapes are supported on this one route:
+    #   - application/json            -> plain text messages (unchanged, original behavior)
+    #   - multipart/form-data          -> text plus optional file/image attachments,
+    #                                     sent as a "files" field (one or more files)
+    # This keeps every existing text-only integration working untouched, while
+    # adding attachments as a pure addition rather than a breaking change.
+    is_multipart = request.content_type and "multipart/form-data" in request.content_type
 
-    if not message:
-        return jsonify({"error": "message is required"}), 400
+    if is_multipart:
+        import json as _json
+        message = (request.form.get("message") or "").strip()
+        try:
+            history = _json.loads(request.form.get("history") or "[]")
+        except ValueError:
+            history = []
+        custom_prompt = (request.form.get("systemPrompt") or "").strip()
+        mode = (request.form.get("mode") or "study").strip().lower()
+        access_token = (request.form.get("accessToken") or "").strip()
+        subject = (request.form.get("subject") or "general").strip()
+        uploaded_files = request.files.getlist("files")
+    else:
+        data = request.get_json(silent=True) or {}
+        message = (data.get("message") or "").strip()
+        history = data.get("history", [])  # optional list of {role, text} for context — used if no logged-in memory
+        custom_prompt = data.get("systemPrompt", "").strip()  # optional override from frontend
+        mode = data.get("mode", "study").strip().lower()  # "study" or "prompt"
+        access_token = data.get("accessToken", "").strip()  # optional Supabase session token
+        subject = (data.get("subject") or "general").strip()  # current subject, for memory scoping
+        uploaded_files = []
+
+    # Process any attachments up front. Images become base64 data URLs for the
+    # vision model; documents get their text extracted for the text model.
+    # attachment_statuses is returned to the frontend so it can show, per file,
+    # whether Pɛ Adesua actually read it or couldn't.
+    images, document_text, attachment_statuses = ([], "", [])
+    if uploaded_files:
+        images, document_text, attachment_statuses = process_uploaded_files(uploaded_files)
+
+    # A message can now be "empty" on its own but still valid if an attachment
+    # carries the actual content (e.g. just a photo with no caption).
+    if not message and not images and not document_text:
+        return jsonify({"error": "message or a readable attachment is required"}), 400
 
     if not GROQ_API_KEY:
         return jsonify({"error": "Server not configured: missing GROQ_API_KEY"}), 500
@@ -243,15 +285,33 @@ def ask():
             "content": turn.get("text", "")
         })
 
-    contents.append({
-        "role": "user",
-        "content": message
-    })
+    # Fold any extracted document text into the visible message text, so it
+    # reads naturally as context the student handed over, not a hidden field.
+    effective_message = message
+    if document_text:
+        prefix = f"{message}\n\n" if message else ""
+        effective_message = f"{prefix}{document_text}"
+
+    # Final user turn — plain text, or multimodal (text + image(s)) when a
+    # photo/screenshot is attached. Groq's vision model uses the same
+    # OpenAI-style content-array format as the text model, just with
+    # image_url blocks alongside the text block.
+    if images:
+        content_blocks = [{"type": "text", "text": effective_message or "What does this show? Explain it."}]
+        for image_data_url in images:
+            content_blocks.append({"type": "image_url", "image_url": {"url": image_data_url}})
+        contents.append({"role": "user", "content": content_blocks})
+    else:
+        contents.append({"role": "user", "content": effective_message})
+
+    # Use the vision model only when an image is attached — keeps normal
+    # text chat (including document-only messages) on the text model.
+    active_model = GROQ_VISION_MODEL if images else GROQ_MODEL
 
     try:
         client = Groq(api_key=GROQ_API_KEY)
         response = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=active_model,
             messages=contents,
             max_tokens=1024,
             temperature=0.8
@@ -259,11 +319,16 @@ def ask():
 
         text = response.choices[0].message.content
 
-        # Save to persistent memory if this is a logged-in student
+        # Save to persistent memory if this is a logged-in student.
+        # (Raw file bytes/images are never saved — only the resulting text.)
         if student_subject_id:
-            save_exchange(student_subject_id, message, text)
+            save_exchange(student_subject_id, effective_message, text)
 
-        return jsonify({"reply": text, "remembered": bool(student_subject_id)})
+        return jsonify({
+            "reply": text,
+            "remembered": bool(student_subject_id),
+            "attachments": attachment_statuses
+        })
 
     except Exception as e:
         return jsonify({"error": f"Groq API error: {str(e)}"}), 502

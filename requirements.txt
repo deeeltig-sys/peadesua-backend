@@ -4,3 +4,5 @@ requests
 groq
 gunicorn
 supabase
+pypdf
+python-docx
